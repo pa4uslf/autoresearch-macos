@@ -42,6 +42,7 @@ class GPTConfig:
     n_kv_head: int = 6
     n_embd: int = 768
     window_pattern: str = "SSSL"
+    logits_chunk_size: int = 0
 
 
 def norm(x):
@@ -303,14 +304,45 @@ class GPT(nn.Module):
         x = norm(x)
 
         softcap = 15
-        logits = self.lm_head(x)
-        logits = logits.float()
-        logits = softcap * torch.tanh(logits / softcap)
-
         if targets is not None:
+            chunk_size = self.config.logits_chunk_size
+            if chunk_size > 0 and T > chunk_size:
+                # MPS is sensitive to the full [B, T, V] logits tensor. Chunking over
+                # time keeps the peak bounded while preserving the exact loss.
+                loss_chunks = []
+                total_loss = x.new_zeros(())
+                total_tokens = targets.new_zeros((), dtype=torch.int64)
+                for start in range(0, T, chunk_size):
+                    end = min(start + chunk_size, T)
+                    logits = self.lm_head(x[:, start:end]).float()
+                    logits = softcap * torch.tanh(logits / softcap)
+                    target_chunk = targets[:, start:end]
+                    chunk_loss = F.cross_entropy(
+                        logits.reshape(-1, logits.size(-1)),
+                        target_chunk.reshape(-1),
+                        ignore_index=-1,
+                        reduction='none',
+                    )
+                    if reduction == 'none':
+                        loss_chunks.append(chunk_loss.view(B, end - start))
+                    else:
+                        total_loss = total_loss + chunk_loss.sum()
+                        total_tokens = total_tokens + target_chunk.ne(-1).sum()
+                if reduction == 'none':
+                    return torch.cat(loss_chunks, dim=1)
+                if reduction == 'sum':
+                    return total_loss
+                return total_loss / total_tokens.clamp_min(1).to(total_loss.dtype)
+
+            logits = self.lm_head(x)
+            logits = logits.float()
+            logits = softcap * torch.tanh(logits / softcap)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1),
                                    ignore_index=-1, reduction=reduction)
             return loss
+        logits = self.lm_head(x)
+        logits = logits.float()
+        logits = softcap * torch.tanh(logits / softcap)
         return logits
 
 # ---------------------------------------------------------------------------
@@ -499,6 +531,7 @@ FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 # Model size
 DEPTH = 4               # number of transformer layers
 DEVICE_BATCH_SIZE = 16  # per-device batch size (reduce if OOM)
+MPS_LOGITS_CHUNK_SIZE = 128  # time-axis chunk size for lm_head loss on MPS
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
@@ -537,6 +570,7 @@ def build_model_config(depth):
         sequence_len=MAX_SEQ_LEN, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=WINDOW_PATTERN,
+        logits_chunk_size=MPS_LOGITS_CHUNK_SIZE if device_type == "mps" else 0,
     )
 
 config = build_model_config(DEPTH)
