@@ -17,6 +17,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(line_buffering=True, write_through=True)
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(line_buffering=True, write_through=True)
+
+IS_TTY = sys.stdout.isatty()
+PROGRESS_LOG_INTERVAL = float(os.environ.get("AUTORESEARCH_PROGRESS_LOG_INTERVAL", "15"))
+
 def verify_macos_env():
     if sys.platform != "darwin":
         raise RuntimeError(f"This script requires macOS with Metal. Detected platform: {sys.platform}")
@@ -128,7 +136,8 @@ class MLP(nn.Module):
 
     def forward(self, x):
         x = self.c_fc(x)
-        x = F.relu(x).square()
+        x = F.relu(x)
+        x = x * x
         x = self.c_proj(x)
         return x
 
@@ -517,7 +526,8 @@ HEAD_DIM = 128          # target head dimension for attention
 WINDOW_PATTERN = "L"    # sliding window pattern: L=full, S=half context
 
 # Optimization
-TOTAL_BATCH_SIZE = 2**16 # ~65K tokens per optimizer step
+DEFAULT_TOTAL_BATCH_SIZE = 2**16  # ~65K tokens per optimizer step
+MPS_TOTAL_BATCH_SIZE = 2**14
 EMBEDDING_LR = 0.6      # learning rate for token embeddings (Adam)
 UNEMBEDDING_LR = 0.004  # learning rate for lm_head (Adam)
 MATRIX_LR = 0.04        # learning rate for matrix parameters (Muon)
@@ -530,7 +540,8 @@ FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 
 # Model size
 DEPTH = 4               # number of transformer layers
-DEVICE_BATCH_SIZE = 16  # per-device batch size (reduce if OOM)
+DEFAULT_DEVICE_BATCH_SIZE = 16
+MPS_DEVICE_BATCH_SIZE = 4
 MPS_LOGITS_CHUNK_SIZE = 128  # time-axis chunk size for lm_head loss on MPS
 
 # ---------------------------------------------------------------------------
@@ -546,6 +557,19 @@ torch.set_float32_matmul_precision("high")
 # Detect device
 device_type = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
 device = torch.device(device_type)
+TOTAL_BATCH_SIZE = int(os.environ.get(
+    "AUTORESEARCH_TOTAL_BATCH_SIZE",
+    str(MPS_TOTAL_BATCH_SIZE if device_type == "mps" else DEFAULT_TOTAL_BATCH_SIZE),
+))
+DEVICE_BATCH_SIZE = int(os.environ.get(
+    "AUTORESEARCH_DEVICE_BATCH_SIZE",
+    str(MPS_DEVICE_BATCH_SIZE if device_type == "mps" else DEFAULT_DEVICE_BATCH_SIZE),
+))
+EVAL_DEVICE_BATCH_SIZE = int(os.environ.get(
+    "AUTORESEARCH_EVAL_BATCH_SIZE",
+    str(128 if device_type == "mps" else DEVICE_BATCH_SIZE),
+))
+WARMUP_EXCLUDED_STEPS = 10 if device_type == "cuda" else 0
 
 # Autocast context
 if device_type == "cuda":
@@ -611,6 +635,12 @@ x, y, epoch = next(train_loader)  # prefetch first batch
 
 print(f"Time budget: {TIME_BUDGET}s")
 print(f"Gradient accumulation steps: {grad_accum_steps}")
+print(f"Train batch size: {DEVICE_BATCH_SIZE}")
+print(f"Eval batch size: {EVAL_DEVICE_BATCH_SIZE}")
+print(f"Warmup excluded steps: {WARMUP_EXCLUDED_STEPS}")
+print("Initial batch prefetched")
+if device_type == "mps":
+    print("MPS explicit synchronize disabled in training loop")
 
 # Schedules (all based on progress = training_time / TIME_BUDGET)
 
@@ -638,12 +668,44 @@ t_start_training = time.time()
 smooth_train_loss = 0
 total_training_time = 0
 step = 0
+last_progress_log_time = time.time() - PROGRESS_LOG_INTERVAL
 
 def sync_device(device_type):
     if device_type == "cuda":
         torch.cuda.synchronize()
-    elif device_type == "mps":
-        torch.mps.synchronize()
+
+def clear_device_cache():
+    if device_type == "cuda":
+        torch.cuda.empty_cache()
+    elif device_type == "mps" and hasattr(torch.mps, "empty_cache"):
+        torch.mps.empty_cache()
+
+def run_final_eval(initial_batch_size):
+    eval_batch_size = initial_batch_size
+    while True:
+        try:
+            with autocast_ctx:
+                val_bpb = evaluate_bpb(model, tokenizer, eval_batch_size)
+            return val_bpb, eval_batch_size
+        except RuntimeError as exc:
+            message = str(exc).lower()
+            oom_like = any(token in message for token in [
+                "out of memory",
+                "oom",
+                "resource",
+                "mps",
+                "invalid buffer size",
+            ])
+            if not oom_like or eval_batch_size <= DEVICE_BATCH_SIZE:
+                raise
+            next_batch_size = max(DEVICE_BATCH_SIZE, eval_batch_size // 2)
+            print(f"final eval failed at batch size {eval_batch_size}: {exc}")
+            if next_batch_size == eval_batch_size:
+                raise
+            print(f"retrying final eval with batch size {next_batch_size}")
+            gc.collect()
+            clear_device_cache()
+            eval_batch_size = next_batch_size
 
 while True:
     sync_device(device_type)
@@ -680,7 +742,7 @@ while True:
     t1 = time.time()
     dt = t1 - t0
 
-    if step > 10:
+    if step >= WARMUP_EXCLUDED_STEPS:
         total_training_time += dt
 
     # Logging
@@ -692,7 +754,17 @@ while True:
     mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / H100_BF16_PEAK_FLOPS
     remaining = max(0, TIME_BUDGET - total_training_time)
 
-    print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
+    progress_message = (
+        f"step {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | "
+        f"lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | "
+        f"mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s"
+    )
+    now = time.time()
+    if IS_TTY:
+        print(f"\r{progress_message}    ", end="", flush=True)
+    elif step == 0 or now - last_progress_log_time >= PROGRESS_LOG_INTERVAL or remaining <= 5:
+        print(progress_message)
+        last_progress_log_time = now
 
     # GC management (Python's GC causes ~500ms stalls)
     if step == 0:
@@ -705,22 +777,27 @@ while True:
     step += 1
 
     # Time's up — but only stop after warmup steps so we don't count compilation
-    if step > 10 and total_training_time >= TIME_BUDGET:
+    if step > WARMUP_EXCLUDED_STEPS and total_training_time >= TIME_BUDGET:
         break
 
-print()  # newline after \r training log
+if IS_TTY:
+    print()  # newline after \r training log
 
 total_tokens = step * TOTAL_BATCH_SIZE
 
 # Final eval
 model.eval()
-with autocast_ctx:
-    val_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE)
+eval_t0 = time.time()
+print("---")
+print(f"training finished, starting final eval at +{eval_t0 - t_start:.1f}s")
+val_bpb, actual_eval_batch_size = run_final_eval(EVAL_DEVICE_BATCH_SIZE)
+eval_seconds = time.time() - eval_t0
 
 # Final summary
 t_end = time.time()
 startup_time = t_start_training - t_start
-steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / H100_BF16_PEAK_FLOPS if total_training_time > 0 else 0
+counted_steps = max(step - WARMUP_EXCLUDED_STEPS, 0)
+steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * counted_steps / total_training_time / H100_BF16_PEAK_FLOPS if total_training_time > 0 else 0
 if device_type == "cuda":
     peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
 else:
@@ -729,6 +806,8 @@ else:
 print("---")
 print(f"val_bpb:          {val_bpb:.6f}")
 print(f"training_seconds: {total_training_time:.1f}")
+print(f"eval_batch_size:  {actual_eval_batch_size}")
+print(f"eval_seconds:     {eval_seconds:.1f}")
 print(f"total_seconds:    {t_end - t_start:.1f}")
 print(f"peak_vram_mb:     {peak_vram_mb:.1f}")
 print(f"mfu_percent:      {steady_state_mfu:.2f}")

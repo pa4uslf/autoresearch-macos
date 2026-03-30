@@ -19,3 +19,5 @@ AGENTS.md
 # Experimental code/artifacts
 dev/
 excalidraw.log
+run.log
+run.pid
