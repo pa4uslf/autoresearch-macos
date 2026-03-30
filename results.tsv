@@ -1,0 +1,2 @@
+commit	val_bpb	memory_gb	status	description
+35273db	0.000000	0.0	crash	baseline run exceeded 10 minutes under elevated execution
